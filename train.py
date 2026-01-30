@@ -11,15 +11,31 @@ from datetime import datetime
 
 from datasets.mhcd_dataset import MHCDDataset
 
-from models.unetpp_dcn_cbam import (
-    UNetPP_DCNv1_CBAM_BEM,
-    UNetPP_DCNv2_CBAM_BEM,
-    UNetPP_DCNv3_CBAM_BEM,
-    UNetPP_DCNv4_CBAM_BEM,
-    UNetPP_CBAM,
-    UNetPP_CBAM_BEM,
-    UNetPP_BEM,
-    UNetPP_DCN_BEM
+from models.unetpp import (
+    UNetPP,
+    UNetPP_B3,
+    UNetPP_Resnet50,
+    UNetPP_B3_BEM,
+)
+from models.unet import (
+    UNet,
+    UNet_B3,
+    UNet_Resnet50,
+    UNet_B3_BEM,
+)
+from models.unet3plus import (
+    UNet3Plus,
+    UNet3Plus_ResNet50,
+    UNet3Plus_B0,
+    UNet3Plus_B1,
+    UNet3Plus_B2,
+    UNet3Plus_B3,
+    UNet3Plus_B4,
+    UNet3Plus_B5,
+    UNet3Plus_B3_BEM,
+    UNet3Plus_PVT_V2_B1,
+    UNet3Plus_PVT_V2_B2,
+    UNet3Plus_PVT_V2_B3
 )
 from metrics.s_measure_paper import s_measure
 from metrics.e_measure_paper import e_measure
@@ -33,11 +49,11 @@ class Config:
     """Centralized configuration for training"""
     def __init__(self):
         # Model selection - now with DCN + CBAM + BEM variants!
-        self.model_name = "UNetPP_BEM"  # New full model
+        self.model_name = "UNet3Plus_PVT_V2_B2"  # New full model
         
         # Dataset
         self.root = "../MHCD_seg"
-        self.img_size = 640  # Increased from 256 - better for COD
+        self.img_size = 352  # Increased from 256 - better for COD
         
         # Training
         self.epochs = 120
@@ -48,13 +64,26 @@ class Config:
         self.lr_encoder = 1e-5  # Lower LR for pretrained encoder
         self.lr_dcn = 1e-4      # Higher LR for DCN modules
         self.weight_decay = 1e-4
-        
+
         # Loss weights
         self.lambda_bce = 0.0
-        self.lambda_dice = 0.35
-        self.lambda_iou = 0
-        self.lambda_focal = 0.35  # NEW: Focal loss weight
+        self.lambda_dice = 0.4
+        self.lambda_iou = 0.0
+        self.lambda_focal = 0.4  # NEW: Focal loss weight
         self.lambda_boundary = 0.3
+        
+        if "BEM" in self.model_name:
+            self.lambda_boundary = 0.3
+            self.lambda_dice = 0.0
+            self.lambda_focal = 0.0
+            self.lambda_bce = 0.35
+            self.lambda_iou = 0.35
+        else:
+            self.lambda_boundary = 0.0
+            self.lambda_dice = 0.0
+            self.lambda_focal = 0.0
+            self.lambda_bce = 0.5
+            self.lambda_iou = 0.5
         
         # Focal loss parameters
         self.focal_alpha = 0.25  # Weight for positive class
@@ -411,14 +440,26 @@ def create_model(model_name, device):
     """
     model_dict = {     
         # UNet++ with CBAM and BEM
-        "UNetPP_DCNv1_CBAM_BEM": UNetPP_DCNv1_CBAM_BEM,
-        "UNetPP_DCNv2_CBAM_BEM": UNetPP_DCNv2_CBAM_BEM,
-        "UNetPP_DCNv3_CBAM_BEM": UNetPP_DCNv3_CBAM_BEM,
-        "UNetPP_DCNv4_CBAM_BEM": UNetPP_DCNv4_CBAM_BEM,
-        "UNetPP_CBAM": UNetPP_CBAM,
-        "UNetPP_CBAM_BEM": UNetPP_CBAM_BEM,
-        "UNetPP_DCN_BEM": UNetPP_DCN_BEM,
-        "UNetPP_BEM": UNetPP_BEM,
+        "UNetPP": UNetPP,
+        "UNetPP_B3": UNetPP_B3,
+        "UNetPP_Resnet50": UNetPP_Resnet50,
+        "UNetPP_B3_BEM": UNetPP_B3_BEM,
+        "UNet": UNet,
+        "UNet_B3": UNet_B3,
+        "UNet_Resnet50": UNet_Resnet50,
+        "UNet_B3_BEM": UNet_B3_BEM,
+        "UNet3Plus": UNet3Plus, 
+        "UNet3Plus_ResNet50": UNet3Plus_ResNet50,
+        "UNet3Plus_B0": UNet3Plus_B0,
+        "UNet3Plus_B1": UNet3Plus_B1,
+        "UNet3Plus_B2": UNet3Plus_B2,
+        "UNet3Plus_B3": UNet3Plus_B3,
+        "UNet3Plus_B4": UNet3Plus_B4,
+        "UNet3Plus_B5": UNet3Plus_B5,
+        "UNet3Plus_B3_BEM": UNet3Plus_B3_BEM,
+        "UNet3Plus_PVT_V2_B1": UNet3Plus_PVT_V2_B1,
+        "UNet3Plus_PVT_V2_B2": UNet3Plus_PVT_V2_B2,
+        "UNet3Plus_PVT_V2_B3": UNet3Plus_PVT_V2_B3
     }
     
     if model_name not in model_dict:
@@ -653,7 +694,7 @@ def main():
         logger.info(f"[VAL]   Loss: {val_metrics['loss']:.4f} | "
                    f"S: {val_metrics['S']:.4f} | "
                    f"E: {val_metrics['E']:.4f} | "
-                   f"F: {val_metrics['F']:.4f} | "
+                   f"F: {val_metrics['Fw']:.4f} | "
                    f"MAE: {val_metrics['MAE']:.4f}")
         
         # Save to CSV

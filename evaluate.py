@@ -7,32 +7,30 @@ import json
 from datetime import datetime
 
 from datasets.mhcd_dataset import MHCDDataset
-from models.unetpp_bem import (
+from models.unetpp import (
     UNetPP,
     UNetPP_B3,
-    UNetPP_DCNv1_COD,
-    UNetPP_DCNv2_COD,
-    UNetPP_DCNv3_COD,
-    UNetPP_DCNv4_COD
+    UNetPP_Resnet50,
+    UNetPP_B3_BEM,
 )
-
-from models.unet3plus_dcn import (
+from models.unet import (
+    UNet,
+    UNet_B3,
+    UNet_Resnet50,
+    UNet_B3_BEM,
+)
+from models.unet3plus import (
+    UNet3Plus,
+    UNet3Plus_ResNet50,
+    UNet3Plus_B0,
+    UNet3Plus_B1,
+    UNet3Plus_B2,
     UNet3Plus_B3,
-    UNet3Plus_DCNv1_COD,
-    UNet3Plus_DCNv2_COD,
-    UNet3Plus_DCNv3_COD,
-    UNet3Plus_DCNv4_COD
-)
-
-from models.unetpp_dcn_cbam import (
-    UNetPP_DCNv1_CBAM_BEM,
-    UNetPP_DCNv2_CBAM_BEM,
-    UNetPP_DCNv3_CBAM_BEM,
-    UNetPP_DCNv4_CBAM_BEM,
-    UNetPP_CBAM,
-    UNetPP_CBAM_BEM,
-    UNetPP_DCN_BEM,
-    UNetPP_BEM
+    UNet3Plus_B4,
+    UNet3Plus_B5,
+    UNet3Plus_B3_BEM,
+    UNet3Plus_PVT_V2_B1,
+    UNet3Plus_PVT_V2_B2
 )
 from metrics.s_measure_paper import s_measure
 from metrics.e_measure_paper import e_measure
@@ -48,16 +46,16 @@ class EvalConfig:
     """Evaluation configuration"""
     def __init__(self):
         # Model to evaluate
-        self.model_name = "UNetPP_BEM"
+        self.model_name = "UNet3Plus_PVT_V2_B1"
         
         # Checkpoint path
-        self.ckpt_path = "logs/UNetPP_BEM_20260106_163941/best_s_measure.pth"
+        self.ckpt_path = "logs/UNet3Plus_PVT_V2_B1_20260130_111854/best_s_measure.pth"
         
         # Dataset
         self.root = "../MHCD_seg"
         self.split = "test"  # or "val"
-        self.img_size = 640
-        self.batch_size = 8
+        self.img_size = 352
+        self.batch_size = 12
         
         # Device
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -75,34 +73,25 @@ def create_model(model_name, device):
     Create model based on name
     """
     models = {
-        # UNet++ baseline variants
         "UNetPP": UNetPP,
         "UNetPP_B3": UNetPP_B3,
-        
-        # UNet++ with DCN only
-        "UNetPP_DCNv1_COD": UNetPP_DCNv1_COD,
-        "UNetPP_DCNv2_COD": UNetPP_DCNv2_COD,
-        "UNetPP_DCNv3_COD": UNetPP_DCNv3_COD,
-        "UNetPP_DCNv4_COD": UNetPP_DCNv4_COD,
-        
-        # UNet3+ variants
+        "UNetPP_Resnet50": UNetPP_Resnet50,
+        "UNetPP_B3_BEM": UNetPP_B3_BEM,
+        "UNet": UNet,
+        "UNet_B3": UNet_B3,
+        "UNet_Resnet50": UNet_Resnet50,
+        "UNet_B3_BEM": UNet_B3_BEM,
+        "UNet3Plus": UNet3Plus, 
+        "UNet3Plus_ResNet50": UNet3Plus_ResNet50,
+        "UNet3Plus_B0": UNet3Plus_B0,
+        "UNet3Plus_B1": UNet3Plus_B1,
+        "UNet3Plus_B2": UNet3Plus_B2,
         "UNet3Plus_B3": UNet3Plus_B3,
-        "UNet3Plus_DCNv1_COD": UNet3Plus_DCNv1_COD,
-        "UNet3Plus_DCNv2_COD": UNet3Plus_DCNv2_COD,
-        "UNet3Plus_DCNv3_COD": UNet3Plus_DCNv3_COD,
-        "UNet3Plus_DCNv4_COD": UNet3Plus_DCNv4_COD,
-        
-        # NEW: UNet++ with DCN + CBAM + BEM
-        "UNetPP_DCNv1_CBAM_BEM": UNetPP_DCNv1_CBAM_BEM,
-        "UNetPP_DCNv2_CBAM_BEM": UNetPP_DCNv2_CBAM_BEM,
-        "UNetPP_DCNv3_CBAM_BEM": UNetPP_DCNv3_CBAM_BEM,
-        "UNetPP_DCNv4_CBAM_BEM": UNetPP_DCNv4_CBAM_BEM,
-        
-        # NEW: Ablation models
-        "UNetPP_CBAM": UNetPP_CBAM,
-        "UNetPP_CBAM_BEM": UNetPP_CBAM_BEM,
-        "UNetPP_DCN_BEM": UNetPP_DCN_BEM,
-        "UNetPP_BEM": UNetPP_BEM
+        "UNet3Plus_B4": UNet3Plus_B4,
+        "UNet3Plus_B5": UNet3Plus_B5,
+        "UNet3Plus_B3_BEM": UNet3Plus_B3_BEM,
+        "UNet3Plus_PVT_V2_B1": UNet3Plus_PVT_V2_B1,
+        "UNet3Plus_PVT_V2_B2": UNet3Plus_PVT_V2_B2
     }
     
     if model_name not in models:
@@ -152,7 +141,7 @@ class MetricsAccumulator:
         self.metrics = {
             "S": [],      # S-measure (Structure)
             "E": [],      # E-measure (Enhanced-alignment)
-            "F": [],      # F-measure (F-beta)
+            #"F": [],      # F-measure (F-beta)
             "Fw": [],     # Weighted F-measure
             "MAE": []     # Mean Absolute Error
         }
@@ -166,7 +155,7 @@ class MetricsAccumulator:
         """
         self.metrics["S"].append(s_measure(pred, target).item())
         self.metrics["E"].append(e_measure(pred, target).item())
-        self.metrics["F"].append(f_measure(pred, target).item())
+        #self.metrics["F"].append(f_measure(pred, target).item())
         self.metrics["Fw"].append(fw_measure(pred, target).item())
         self.metrics["MAE"].append(torch.abs(pred - target).mean().item())
     
@@ -235,7 +224,7 @@ def display_results(summary, logger):
     print("EVALUATION RESULTS")
     print("="*60)
     
-    metrics_order = ['S', 'E', 'F', 'Fw', 'MAE']
+    metrics_order = ['S', 'E', 'Fw', 'MAE']
     
     for metric in metrics_order:
         mean = summary[f"{metric}_mean"]

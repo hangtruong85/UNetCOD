@@ -9,13 +9,5 @@ __pycache__/
 # Model checkpoints and outputs
 *.pth
 *.pt
-outputs/
+eval_results/
 logs/
-
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
