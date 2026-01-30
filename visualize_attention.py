@@ -1,648 +1,524 @@
 """
-Visualization tool for comparing UNet++ vs UNet3+ attention maps
-Includes: Feature maps, DCN offsets, Attention visualization
+Visualization tool for UNet3Plus_B3_BEM model
+Visualizes: Encoder features, Decoder features (full-scale skip connections),
+            Boundary Enhancement Module (BEM), Sobel boundary maps, and attention maps
 """
 
 import os
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-import cv2
-from PIL import Image
 from torch.utils.data import DataLoader
-from torchvision import transforms
 
 from datasets.mhcd_dataset import MHCDDataset
-from models.unetpp_bem import UNetPP_B3, UNetPP_DCNv3_COD
-from models.unet3plus_dcn import UNet3Plus_B3, UNet3Plus_DCNv3_COD
+from models.unet3plus import UNet3Plus_B3_BEM
 
 
 # ============================================================================
-# Hook Manager for Feature Extraction
+# Hook-based Feature Extraction
 # ============================================================================
 
 class FeatureExtractor:
-    """Extract intermediate features using hooks"""
+    """Extract intermediate features from model layers using forward hooks."""
+
     def __init__(self):
         self.features = {}
         self.hooks = []
-    
-    def register_hooks(self, model, layer_names):
+
+    def register_hook(self, module, name):
+        """Register a forward hook on a single module."""
+        hook = module.register_forward_hook(self._make_hook(name))
+        self.hooks.append(hook)
+
+    def register_hooks_by_path(self, model, layer_paths):
         """
-        Register forward hooks to extract features
+        Register hooks by dot-separated module paths.
         Args:
-            model: PyTorch model
-            layer_names: dict mapping layer names to module paths
+            model: nn.Module
+            layer_paths: dict {display_name: "module.path.string"}
         """
-        for name, module_path in layer_names.items():
-            try:
-                # Navigate to the module
-                module = model
-                for attr in module_path.split('.'):
-                    if hasattr(module, attr):
-                        module = getattr(module, attr)
-                    else:
-                        print(f"Warning: Cannot find {attr} in path {module_path}")
-                        break
+        for name, path in layer_paths.items():
+            module = model
+            for attr in path.split('.'):
+                if hasattr(module, attr):
+                    module = getattr(module, attr)
                 else:
-                    # Successfully found the module
-                    hook = module.register_forward_hook(self._make_hook(name))
-                    self.hooks.append(hook)
-            except Exception as e:
-                print(f"Warning: Failed to register hook for {name} at {module_path}: {e}")
-    
+                    print(f"  Warning: cannot find '{attr}' in path '{path}'")
+                    module = None
+                    break
+            if module is not None:
+                self.register_hook(module, name)
+
     def _make_hook(self, name):
-        def hook(module, input, output):
-            self.features[name] = output.detach()
-        return hook
-    
+        def hook_fn(module, input, output):
+            if isinstance(output, torch.Tensor):
+                self.features[name] = output.detach()
+            elif isinstance(output, (tuple, list)) and len(output) > 0:
+                self.features[name] = output[0].detach()
+        return hook_fn
+
     def clear(self):
-        """Clear stored features"""
         self.features = {}
-    
+
     def remove_hooks(self):
-        """Remove all hooks"""
-        for hook in self.hooks:
-            hook.remove()
+        for h in self.hooks:
+            h.remove()
         self.hooks = []
 
 
 # ============================================================================
-# DCN Offset Visualization
+# Attention Map Utilities
 # ============================================================================
 
-class DCNOffsetVisualizer:
-    """Visualize deformable convolution offsets"""
-    
-    @staticmethod
-    def extract_offsets(model, x):
-        """
-        Extract DCN offsets from model
-        Returns dict of offsets at different layers
-        """
-        offsets = {}
-        
-        def hook_fn(name):
-            def hook(module, input, output):
-                if hasattr(module, 'offset_conv'):
-                    # DCNv1
-                    offset = module.offset_conv(input[0])
-                    offsets[name] = offset.detach()
-                elif hasattr(module, 'offset_mask_conv'):
-                    # DCNv2/v3
-                    out = module.offset_mask_conv(input[0])
-                    K = 9  # 3x3 kernel
-                    offset = out[:, :2*K, :, :]
-                    offsets[name] = offset.detach()
-            return hook
-        
-        # Register hooks for DCN modules
-        hooks = []
-        for name, module in model.named_modules():
-            if 'dcn' in name.lower() and ('DCNv1' in str(type(module)) or 
-                                          'DCNv2' in str(type(module)) or
-                                          'DCNv3' in str(type(module))):
-                hook = module.register_forward_hook(hook_fn(name))
-                hooks.append(hook)
-        
-        # Forward pass
-        with torch.no_grad():
-            _ = model(x)
-        
-        # Remove hooks
-        for hook in hooks:
-            hook.remove()
-        
-        return offsets
-    
-    @staticmethod
-    def visualize_offset_field(offset, sample_stride=8):
-        """
-        Visualize offset field as vector field
-        Args:
-            offset: (2*K, H, W) tensor of offsets
-            sample_stride: stride for sampling vectors
-        """
-        # Take first sample point (center of kernel)
-        offset_x = offset[0].cpu().numpy()  # X offsets
-        offset_y = offset[1].cpu().numpy()  # Y offsets
-        
-        H, W = offset_x.shape
-        
-        # Create grid
-        y_grid = np.arange(0, H, sample_stride)
-        x_grid = np.arange(0, W, sample_stride)
-        
-        # Sample offsets
-        Y, X = np.meshgrid(y_grid, x_grid, indexing='ij')
-        
-        U = offset_x[Y, X]
-        V = offset_y[Y, X]
-        
-        return X, Y, U, V
+def generate_cam(features, method='norm'):
+    """
+    Generate Class Activation Map from feature tensor.
+    Args:
+        features: (B, C, H, W)
+        method: 'mean' | 'max' | 'norm'
+    Returns:
+        cam: (B, 1, H, W)
+    """
+    if method == 'mean':
+        return features.mean(dim=1, keepdim=True)
+    elif method == 'max':
+        return features.max(dim=1, keepdim=True)[0]
+    elif method == 'norm':
+        return torch.norm(features, dim=1, keepdim=True)
+    else:
+        raise ValueError(f"Unknown CAM method: {method}")
+
+
+def normalize_to_numpy(tensor):
+    """Normalize a (H, W) or (1, H, W) tensor to [0,1] numpy array."""
+    t = tensor.squeeze().cpu().float()
+    t_min, t_max = t.min(), t.max()
+    if t_max - t_min > 1e-8:
+        t = (t - t_min) / (t_max - t_min)
+    else:
+        t = torch.zeros_like(t)
+    return t.numpy()
+
+
+def tensor_to_rgb(image_tensor):
+    """Convert (3, H, W) normalized image tensor back to displayable [0,1] RGB."""
+    img = image_tensor.cpu().permute(1, 2, 0).numpy()
+    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+    return img
 
 
 # ============================================================================
-# Attention Map Generator
+# UNet3Plus_B3_BEM Visualizer
 # ============================================================================
 
-class AttentionMapGenerator:
-    """Generate attention maps from features"""
-    
-    @staticmethod
-    def generate_cam(features, method='mean'):
-        """
-        Generate Class Activation Map (CAM)
-        Args:
-            features: (B, C, H, W) feature tensor
-            method: 'mean', 'max', or 'norm'
-        """
-        if method == 'mean':
-            cam = features.mean(dim=1, keepdim=True)
-        elif method == 'max':
-            cam = features.max(dim=1, keepdim=True)[0]
-        elif method == 'norm':
-            cam = torch.norm(features, dim=1, keepdim=True)
-        else:
-            raise ValueError(f"Unknown method: {method}")
-        
-        return cam
-    
-    @staticmethod
-    def normalize_cam(cam):
-        """Normalize CAM to [0, 1]"""
-        cam = cam.squeeze()
-        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-        return cam.cpu().numpy()
+class UNet3PlusBEMVisualizer:
+    """
+    Comprehensive visualization for UNet3Plus_B3_BEM.
 
+    Generates a multi-row figure:
+        Row 1: Input | Ground Truth | Prediction | Overlay | Error Map
+        Row 2: Encoder features (e1 .. e5)
+        Row 3: Decoder features (d4, d3, d2, d1) + BEM output
+        Row 4: BEM analysis (edge features, Sobel boundary, boundary pred, overlay)
+        Row 5: Attention maps (CAM) at different decoder levels
+    """
 
-# ============================================================================
-# Comprehensive Visualization
-# ============================================================================
-
-class ModelVisualizer:
-    """Main visualization class"""
-    
-    def __init__(self, model, model_name, device='cuda'):
+    def __init__(self, model, device='cuda'):
         self.model = model.to(device).eval()
-        self.model_name = model_name
         self.device = device
-        self.feature_extractor = FeatureExtractor()
-    
+        self.extractor = FeatureExtractor()
+
+    # ------------------------------------------------------------------
+    # Hook registration helpers
+    # ------------------------------------------------------------------
+
+    def _register_encoder_hooks(self):
+        """Register hooks on encoder stages to capture e1..e5."""
+        encoder = self.model.encoder
+        # smp encoder stages are accessible via encoder._blocks or encoder.model
+        # The simplest way: hook into the encoder's forward and capture the list output
+        # Instead we hook the whole encoder and intercept its return value
+        def encoder_hook(module, input, output):
+            # output is a list [e0, e1, e2, e3, e4, e5]
+            if isinstance(output, (list, tuple)):
+                for i, feat in enumerate(output):
+                    if isinstance(feat, torch.Tensor):
+                        self.extractor.features[f'e{i}'] = feat.detach()
+        hook = encoder.register_forward_hook(encoder_hook)
+        self.extractor.hooks.append(hook)
+
+    def _register_decoder_hooks(self):
+        """Register hooks on decoder blocks to capture d1..d4."""
+        for name in ['decoder4', 'decoder3', 'decoder2', 'decoder1']:
+            module = getattr(self.model, name, None)
+            if module is not None:
+                self.extractor.register_hook(module, name.replace('decoder', 'd'))
+
+    def _register_bem_hooks(self):
+        """Register hooks on BEM sub-modules."""
+        bem = self.model.bem
+
+        # Edge conv output
+        self.extractor.register_hook(bem.edge_conv, 'bem_edge_conv')
+
+        # Fusion output
+        self.extractor.register_hook(bem.fusion, 'bem_fusion')
+
+        # Boundary head (if exists)
+        if hasattr(bem, 'boundary_head'):
+            self.extractor.register_hook(bem.boundary_head, 'bem_boundary_head')
+
+    # ------------------------------------------------------------------
+    # Forward with hooks
+    # ------------------------------------------------------------------
+
+    def _forward_with_hooks(self, image):
+        """Run forward pass with all hooks registered, return (pred_logit, boundary_logit)."""
+        self.extractor.clear()
+        self.extractor.remove_hooks()
+
+        self._register_encoder_hooks()
+        self._register_decoder_hooks()
+        self._register_bem_hooks()
+
+        with torch.no_grad():
+            output = self.model(image, return_boundary=True)
+
+        if isinstance(output, tuple):
+            pred_logit, boundary_logit = output
+        else:
+            pred_logit = output
+            boundary_logit = None
+
+        return pred_logit, boundary_logit
+
+    # ------------------------------------------------------------------
+    # Individual row renderers
+    # ------------------------------------------------------------------
+
+    def _draw_row_basic(self, axes, img_np, mask_np, pred_np):
+        """Row 1: Input, GT, Prediction, Overlay, Error Map."""
+        axes[0].imshow(img_np)
+        axes[0].set_title('Input Image', fontsize=10, fontweight='bold')
+
+        axes[1].imshow(mask_np, cmap='gray')
+        axes[1].set_title('Ground Truth', fontsize=10, fontweight='bold')
+
+        axes[2].imshow(pred_np, cmap='gray')
+        axes[2].set_title('Prediction', fontsize=10, fontweight='bold')
+
+        axes[3].imshow(img_np)
+        axes[3].imshow(pred_np, cmap='jet', alpha=0.5)
+        axes[3].set_title('Overlay', fontsize=10, fontweight='bold')
+
+        error = np.abs(mask_np - pred_np)
+        im = axes[4].imshow(error, cmap='hot', vmin=0, vmax=1)
+        axes[4].set_title(f'Error Map (MAE={error.mean():.4f})', fontsize=10, fontweight='bold')
+        plt.colorbar(im, ax=axes[4], fraction=0.046)
+
+    def _draw_row_encoder(self, axes):
+        """Row 2: Encoder features e1..e5."""
+        features = self.extractor.features
+        for i in range(5):
+            key = f'e{i+1}'
+            ax = axes[i]
+            if key in features:
+                feat = features[key]
+                cam = generate_cam(feat, method='norm')
+                cam_np = normalize_to_numpy(cam[0])
+                im = ax.imshow(cam_np, cmap='jet')
+                ax.set_title(f'{key} ({feat.shape[1]}ch, {feat.shape[2]}x{feat.shape[3]})',
+                             fontsize=9)
+                plt.colorbar(im, ax=ax, fraction=0.046)
+            else:
+                ax.text(0.5, 0.5, f'{key}\nnot found', ha='center', va='center', fontsize=9)
+
+    def _draw_row_decoder(self, axes):
+        """Row 3: Decoder features d4, d3, d2, d1 + BEM fusion output."""
+        features = self.extractor.features
+        decoder_keys = ['d4', 'd3', 'd2', 'd1']
+
+        for i, key in enumerate(decoder_keys):
+            ax = axes[i]
+            if key in features:
+                feat = features[key]
+                cam = generate_cam(feat, method='norm')
+                cam_np = normalize_to_numpy(cam[0])
+                im = ax.imshow(cam_np, cmap='jet')
+                ax.set_title(f'{key} ({feat.shape[1]}ch, {feat.shape[2]}x{feat.shape[3]})',
+                             fontsize=9)
+                plt.colorbar(im, ax=ax, fraction=0.046)
+            else:
+                ax.text(0.5, 0.5, f'{key}\nnot found', ha='center', va='center', fontsize=9)
+
+        # Column 5: BEM fusion
+        ax = axes[4]
+        if 'bem_fusion' in features:
+            feat = features['bem_fusion']
+            cam = generate_cam(feat, method='norm')
+            cam_np = normalize_to_numpy(cam[0])
+            im = ax.imshow(cam_np, cmap='jet')
+            ax.set_title(f'BEM Fusion ({feat.shape[1]}ch)', fontsize=9, fontweight='bold')
+            plt.colorbar(im, ax=ax, fraction=0.046)
+        else:
+            ax.text(0.5, 0.5, 'BEM Fusion\nnot found', ha='center', va='center', fontsize=9)
+
+    def _draw_row_bem(self, axes, img_np, mask_np, pred_np, boundary_logit):
+        """Row 4: BEM analysis -- edge features, Sobel boundary (from GT), boundary pred, overlays."""
+        features = self.extractor.features
+
+        # Col 0: BEM edge conv features
+        ax = axes[0]
+        if 'bem_edge_conv' in features:
+            feat = features['bem_edge_conv']
+            cam = generate_cam(feat, method='norm')
+            cam_np = normalize_to_numpy(cam[0])
+            im = ax.imshow(cam_np, cmap='inferno')
+            ax.set_title('BEM Edge Features', fontsize=9, fontweight='bold')
+            plt.colorbar(im, ax=ax, fraction=0.046)
+        else:
+            ax.text(0.5, 0.5, 'Edge features\nnot found', ha='center', va='center', fontsize=9)
+
+        # Col 1: Sobel boundary from GT mask
+        ax = axes[1]
+        mask_t = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).float().to(self.device)
+        sobel_boundary = self.model.bem.extract_boundary_map(mask_t)
+        sobel_np = normalize_to_numpy(sobel_boundary[0])
+        im = ax.imshow(sobel_np, cmap='hot')
+        ax.set_title('GT Boundary (Sobel)', fontsize=9, fontweight='bold')
+        plt.colorbar(im, ax=ax, fraction=0.046)
+
+        # Col 2: Boundary prediction
+        ax = axes[2]
+        if boundary_logit is not None:
+            boundary_pred = torch.sigmoid(boundary_logit)
+            boundary_np = boundary_pred[0, 0].cpu().numpy()
+            im = ax.imshow(boundary_np, cmap='hot')
+            ax.set_title('Boundary Prediction', fontsize=9, fontweight='bold')
+            plt.colorbar(im, ax=ax, fraction=0.046)
+        elif 'bem_boundary_head' in features:
+            feat = features['bem_boundary_head']
+            boundary_np = torch.sigmoid(feat[0, 0]).cpu().numpy()
+            im = ax.imshow(boundary_np, cmap='hot')
+            ax.set_title('Boundary Prediction', fontsize=9, fontweight='bold')
+            plt.colorbar(im, ax=ax, fraction=0.046)
+        else:
+            ax.text(0.5, 0.5, 'No boundary\nprediction', ha='center', va='center', fontsize=9)
+            boundary_np = None
+
+        # Col 3: Boundary overlay on image
+        ax = axes[3]
+        ax.imshow(img_np)
+        if boundary_logit is not None:
+            boundary_overlay = torch.sigmoid(boundary_logit)[0, 0].cpu().numpy()
+            ax.imshow(boundary_overlay, cmap='Reds', alpha=0.6)
+        ax.set_title('Boundary Overlay', fontsize=9, fontweight='bold')
+
+        # Col 4: Prediction contour on image
+        ax = axes[4]
+        ax.imshow(img_np)
+        # Draw prediction contour and GT contour
+        ax.contour(mask_np, levels=[0.5], colors='lime', linewidths=1.5)
+        ax.contour(pred_np, levels=[0.5], colors='red', linewidths=1.5)
+        ax.set_title('Contours (Green=GT, Red=Pred)', fontsize=9, fontweight='bold')
+
+    def _draw_row_attention(self, axes, image):
+        """Row 5: Attention maps (Grad-CAM style) from decoder levels."""
+        features = self.extractor.features
+        # Show CAM with different methods for different decoder levels
+        methods = [('d4', 'mean'), ('d3', 'mean'), ('d2', 'max'), ('d1', 'max'), ('bem_fusion', 'norm')]
+        labels = ['d4 (mean)', 'd3 (mean)', 'd2 (max)', 'd1 (max)', 'BEM (norm)']
+
+        img_size = image.shape[2:]  # (H, W)
+
+        for i, ((key, method), label) in enumerate(zip(methods, labels)):
+            ax = axes[i]
+            if key in features:
+                feat = features[key]
+                cam = generate_cam(feat, method=method)
+                # Upsample to input resolution
+                cam_up = F.interpolate(cam, size=img_size, mode='bilinear', align_corners=False)
+                cam_np = normalize_to_numpy(cam_up[0])
+
+                # Overlay on input image
+                img_np = tensor_to_rgb(image[0])
+                ax.imshow(img_np)
+                ax.imshow(cam_np, cmap='jet', alpha=0.5)
+                ax.set_title(f'CAM: {label}', fontsize=9)
+            else:
+                ax.text(0.5, 0.5, f'{key}\nnot found', ha='center', va='center', fontsize=9)
+
+    # ------------------------------------------------------------------
+    # Main visualization entry
+    # ------------------------------------------------------------------
+
     def visualize_sample(self, image, mask, save_path):
         """
-        Create comprehensive visualization for one sample
+        Create full visualization for one sample.
         Args:
-            image: input image tensor (1, 3, H, W)
-            mask: ground truth mask (1, 1, H, W)
-            save_path: path to save visualization
+            image: (1, 3, H, W) tensor
+            mask: (1, 1, H, W) tensor
+            save_path: output image path
         """
         image = image.to(self.device)
         mask = mask.to(self.device)
-        
-        # Forward pass
-        with torch.no_grad():
-            pred = self.model(image)
-            pred_prob = torch.sigmoid(pred)
-        
-        # Convert to numpy for visualization
-        img_np = image[0].cpu().permute(1, 2, 0).numpy()
-        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
-        
+
+        # Forward pass with hooks
+        pred_logit, boundary_logit = self._forward_with_hooks(image)
+        pred_prob = torch.sigmoid(pred_logit)
+
+        # Convert to numpy
+        img_np = tensor_to_rgb(image[0])
         mask_np = mask[0, 0].cpu().numpy()
         pred_np = pred_prob[0, 0].cpu().numpy()
-        
-        # Create figure
-        fig = plt.figure(figsize=(20, 12))
-        gs = GridSpec(3, 5, figure=fig, hspace=0.3, wspace=0.3)
-        
-        # Row 1: Basic results
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.imshow(img_np)
-        ax1.set_title('Input Image', fontsize=12, fontweight='bold')
-        ax1.axis('off')
-        
-        ax2 = fig.add_subplot(gs[0, 1])
-        ax2.imshow(mask_np, cmap='gray')
-        ax2.set_title('Ground Truth', fontsize=12, fontweight='bold')
-        ax2.axis('off')
-        
-        ax3 = fig.add_subplot(gs[0, 2])
-        ax3.imshow(pred_np, cmap='gray')
-        ax3.set_title('Prediction', fontsize=12, fontweight='bold')
-        ax3.axis('off')
-        
-        ax4 = fig.add_subplot(gs[0, 3])
-        ax4.imshow(img_np)
-        ax4.imshow(pred_np, cmap='jet', alpha=0.5)
-        ax4.set_title('Overlay', fontsize=12, fontweight='bold')
-        ax4.axis('off')
-        
-        ax5 = fig.add_subplot(gs[0, 4])
-        error_map = np.abs(mask_np - pred_np)
-        im = ax5.imshow(error_map, cmap='hot')
-        ax5.set_title('Error Map', fontsize=12, fontweight='bold')
-        ax5.axis('off')
-        plt.colorbar(im, ax=ax5, fraction=0.046)
-        
-        # Row 2: Feature maps at different scales
-        self._visualize_feature_maps(fig, gs, image, row=1)
-        
-        # Row 3: DCN offsets (if model has DCN)
-        if 'DCN' in self.model_name:
-            self._visualize_dcn_offsets(fig, gs, image, row=2)
-        else:
-            # Show attention maps instead
-            self._visualize_attention_maps(fig, gs, image, row=2)
-        
-        # Add title
-        fig.suptitle(f'{self.model_name} - Visualization', 
-                    fontsize=16, fontweight='bold', y=0.98)
-        
-        # Save
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print(f"✓ Saved visualization to: {save_path}")
-    
-    def _visualize_feature_maps(self, fig, gs, image, row):
-        """Visualize feature maps from different decoder levels"""
-        
-        # Register hooks for encoder/decoder features
-        # First, let's detect the model structure dynamically
-        layer_names = self._get_layer_paths()
-        
-        if not layer_names:
-            # If no layers found, show message
-            ax = fig.add_subplot(gs[row, :])
-            ax.text(0.5, 0.5, 'Feature extraction not available for this model', 
-                   ha='center', va='center', fontsize=12)
-            ax.axis('off')
-            return
-        
-        self.feature_extractor.register_hooks(self.model, layer_names)
-        
-        # Forward pass to extract features
-        with torch.no_grad():
-            _ = self.model(image)
-        
-        features = self.feature_extractor.features
-        
-        # Visualize selected features
-        feature_keys = list(features.keys())[:5]
-        
-        for i, key in enumerate(feature_keys):
-            if i >= 5:
-                break
-            
-            if key in features:
-                ax = fig.add_subplot(gs[row, i])
-                
-                # Generate attention map
-                feat = features[key]
-                cam = AttentionMapGenerator.generate_cam(feat, method='norm')
-                cam_np = AttentionMapGenerator.normalize_cam(cam)
-                
-                im = ax.imshow(cam_np, cmap='jet')
-                ax.set_title(f'{key}\n({feat.shape[1]}ch, {feat.shape[2]}x{feat.shape[3]})', 
-                           fontsize=9)
+
+        # Create 5-row x 5-col figure
+        fig = plt.figure(figsize=(22, 22))
+        gs = GridSpec(5, 5, figure=fig, hspace=0.35, wspace=0.3)
+
+        # Build axes grid
+        axes = [[fig.add_subplot(gs[r, c]) for c in range(5)] for r in range(5)]
+
+        # Row 0: Basic results
+        self._draw_row_basic(axes[0], img_np, mask_np, pred_np)
+
+        # Row 1: Encoder features
+        self._draw_row_encoder(axes[1])
+
+        # Row 2: Decoder features + BEM fusion
+        self._draw_row_decoder(axes[2])
+
+        # Row 3: BEM analysis
+        self._draw_row_bem(axes[3], img_np, mask_np, pred_np, boundary_logit)
+
+        # Row 4: Attention maps (CAM overlay)
+        self._draw_row_attention(axes[4], image)
+
+        # Turn off all axes ticks
+        for row in axes:
+            for ax in row:
                 ax.axis('off')
-                plt.colorbar(im, ax=ax, fraction=0.046)
-        
-        self.feature_extractor.clear()
-        self.feature_extractor.remove_hooks()
-    
-    def _get_layer_paths(self):
-        """
-        Dynamically find important layers to visualize
-        Returns dict of layer_name -> module_path
-        """
-        layer_paths = {}
-        
-        # Collect all conv layers with reasonable sizes
-        conv_layers = []
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.Conv2d):
-                if 16 <= module.out_channels <= 512:
-                    conv_layers.append((name, module.out_channels))
-        
-        if not conv_layers:
-            return layer_paths
-        
-        # Separate encoder and decoder layers
-        encoder_layers = [(n, c) for n, c in conv_layers if 'encoder' in n.lower()]
-        decoder_layers = [(n, c) for n, c in conv_layers if 'decoder' in n.lower()]
-        
-        # Select layers at different depths
-        # Try to get 2-3 encoder layers and 2 decoder layers
-        if encoder_layers:
-            # Get layers from different depths
-            step = max(1, len(encoder_layers) // 3)
-            selected_encoder = encoder_layers[::step][:3]
-            
-            for i, (name, channels) in enumerate(selected_encoder):
-                layer_paths[f'encoder_{i}'] = name
-        
-        if decoder_layers:
-            # Get first and last decoder layers
-            if len(decoder_layers) >= 2:
-                layer_paths['decoder_early'] = decoder_layers[0][0]
-                layer_paths['decoder_late'] = decoder_layers[-1][0]
-            elif len(decoder_layers) == 1:
-                layer_paths['decoder'] = decoder_layers[0][0]
-        
-        return layer_paths
-    
-    def _visualize_dcn_offsets(self, fig, gs, image, row):
-        """Visualize DCN offset fields"""
-        
-        # Extract offsets
-        offsets = DCNOffsetVisualizer.extract_offsets(self.model, image)
-        
-        if not offsets:
-            # No DCN modules found
-            ax = fig.add_subplot(gs[row, :])
-            ax.text(0.5, 0.5, 'No DCN offsets to visualize', 
-                   ha='center', va='center', fontsize=14)
-            ax.axis('off')
-            return
-        
-        # Visualize first 5 offset fields
-        offset_items = list(offsets.items())[:5]
-        
-        for i, (name, offset) in enumerate(offset_items):
-            if i >= 5:
-                break
-            
-            ax = fig.add_subplot(gs[row, i])
-            
-            # Get offset field
-            offset_data = offset[0]  # First sample in batch
-            X, Y, U, V = DCNOffsetVisualizer.visualize_offset_field(
-                offset_data, sample_stride=8
+
+        # Row labels on the left
+        row_labels = [
+            'Predictions',
+            'Encoder Features (e1-e5)',
+            'Decoder Features (d4-d1) + BEM',
+            'Boundary Enhancement Module',
+            'Attention Maps (CAM)',
+        ]
+        for r, label in enumerate(row_labels):
+            axes[r][0].annotate(
+                label, xy=(-0.15, 0.5), xycoords='axes fraction',
+                fontsize=11, fontweight='bold', rotation=90,
+                ha='center', va='center',
             )
-            
-            # Compute offset magnitude for background
-            magnitude = np.sqrt(U**2 + V**2)
-            
-            # Plot
-            im = ax.imshow(magnitude, cmap='viridis', alpha=0.6)
-            ax.quiver(X, Y, U, V, color='red', alpha=0.8, scale=50)
-            
-            layer_name = name.split('.')[-2] if '.' in name else name
-            ax.set_title(f'DCN Offsets\n{layer_name}', fontsize=10)
-            ax.axis('off')
-            plt.colorbar(im, ax=ax, fraction=0.046)
-    
-    def _visualize_attention_maps(self, fig, gs, image, row):
-        """Visualize attention maps for baseline models"""
-        
-        # For baseline models, show gradient-based attention
-        # This requires grad-cam or similar techniques
-        
-        ax = fig.add_subplot(gs[row, :])
-        ax.text(0.5, 0.5, 
-               'Baseline model - No DCN offsets\n(Feature maps shown in row above)', 
-               ha='center', va='center', fontsize=12)
-        ax.axis('off')
 
+        fig.suptitle('UNet3Plus_B3_BEM  --  Visualization', fontsize=16, fontweight='bold', y=0.98)
 
-# ============================================================================
-# Comparison Visualization
-# ============================================================================
-
-class ComparisonVisualizer:
-    """Compare two models side by side"""
-    
-    def __init__(self, model1, model1_name, model2, model2_name, device='cuda'):
-        self.vis1 = ModelVisualizer(model1, model1_name, device)
-        self.vis2 = ModelVisualizer(model2, model2_name, device)
-        self.device = device
-    
-    def compare_sample(self, image, mask, save_path):
-        """
-        Create side-by-side comparison
-        """
-        image = image.to(self.device)
-        mask = mask.to(self.device)
-        
-        # Get predictions from both models
-        with torch.no_grad():
-            pred1 = torch.sigmoid(self.vis1.model(image))
-            pred2 = torch.sigmoid(self.vis2.model(image))
-        
-        # Convert to numpy
-        img_np = image[0].cpu().permute(1, 2, 0).numpy()
-        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
-        
-        mask_np = mask[0, 0].cpu().numpy()
-        pred1_np = pred1[0, 0].cpu().numpy()
-        pred2_np = pred2[0, 0].cpu().numpy()
-        
-        # Create comparison figure
-        fig, axes = plt.subplots(3, 5, figsize=(20, 12))
-        
-        # Row 1: Model 1
-        axes[0, 0].imshow(img_np)
-        axes[0, 0].set_title('Input Image', fontweight='bold')
-        axes[0, 0].axis('off')
-        
-        axes[0, 1].imshow(mask_np, cmap='gray')
-        axes[0, 1].set_title('Ground Truth', fontweight='bold')
-        axes[0, 1].axis('off')
-        
-        axes[0, 2].imshow(pred1_np, cmap='gray')
-        axes[0, 2].set_title(f'{self.vis1.model_name}\nPrediction', fontweight='bold')
-        axes[0, 2].axis('off')
-        
-        axes[0, 3].imshow(img_np)
-        axes[0, 3].imshow(pred1_np, cmap='jet', alpha=0.5)
-        axes[0, 3].set_title('Overlay', fontweight='bold')
-        axes[0, 3].axis('off')
-        
-        error1 = np.abs(mask_np - pred1_np)
-        im1 = axes[0, 4].imshow(error1, cmap='hot')
-        axes[0, 4].set_title(f'Error (MAE={error1.mean():.4f})', fontweight='bold')
-        axes[0, 4].axis('off')
-        plt.colorbar(im1, ax=axes[0, 4], fraction=0.046)
-        
-        # Row 2: Model 2
-        axes[1, 0].imshow(img_np)
-        axes[1, 0].set_title('Input Image', fontweight='bold')
-        axes[1, 0].axis('off')
-        
-        axes[1, 1].imshow(mask_np, cmap='gray')
-        axes[1, 1].set_title('Ground Truth', fontweight='bold')
-        axes[1, 1].axis('off')
-        
-        axes[1, 2].imshow(pred2_np, cmap='gray')
-        axes[1, 2].set_title(f'{self.vis2.model_name}\nPrediction', fontweight='bold')
-        axes[1, 2].axis('off')
-        
-        axes[1, 3].imshow(img_np)
-        axes[1, 3].imshow(pred2_np, cmap='jet', alpha=0.5)
-        axes[1, 3].set_title('Overlay', fontweight='bold')
-        axes[1, 3].axis('off')
-        
-        error2 = np.abs(mask_np - pred2_np)
-        im2 = axes[1, 4].imshow(error2, cmap='hot')
-        axes[1, 4].set_title(f'Error (MAE={error2.mean():.4f})', fontweight='bold')
-        axes[1, 4].axis('off')
-        plt.colorbar(im2, ax=axes[1, 4], fraction=0.046)
-        
-        # Row 3: Difference analysis
-        axes[2, 0].axis('off')
-        
-        diff = pred1_np - pred2_np
-        im3 = axes[2, 1].imshow(diff, cmap='RdBu_r', vmin=-1, vmax=1)
-        axes[2, 1].set_title('Prediction Difference\n(Model1 - Model2)', fontweight='bold')
-        axes[2, 1].axis('off')
-        plt.colorbar(im3, ax=axes[2, 1], fraction=0.046)
-        
-        # Both predictions
-        axes[2, 2].imshow(pred1_np, cmap='Reds', alpha=0.5)
-        axes[2, 2].imshow(pred2_np, cmap='Blues', alpha=0.5)
-        axes[2, 2].set_title('Both Predictions\n(Red=M1, Blue=M2)', fontweight='bold')
-        axes[2, 2].axis('off')
-        
-        # Agreement map
-        agreement = 1 - np.abs(pred1_np - pred2_np)
-        im4 = axes[2, 3].imshow(agreement, cmap='YlGn')
-        axes[2, 3].set_title(f'Agreement Map\n(Mean={agreement.mean():.4f})', fontweight='bold')
-        axes[2, 3].axis('off')
-        plt.colorbar(im4, ax=axes[2, 3], fraction=0.046)
-        
-        # Metrics comparison
-        axes[2, 4].axis('off')
-        metrics_text = f"""
-        Model 1: {self.vis1.model_name}
-        MAE: {error1.mean():.4f}
-        
-        Model 2: {self.vis2.model_name}
-        MAE: {error2.mean():.4f}
-        
-        Difference: {abs(error1.mean() - error2.mean()):.4f}
-        Better: {'Model 1' if error1.mean() < error2.mean() else 'Model 2'}
-        """
-        axes[2, 4].text(0.1, 0.5, metrics_text, fontsize=10, 
-                       verticalalignment='center', family='monospace')
-        
-        plt.suptitle(f'Model Comparison: {self.vis1.model_name} vs {self.vis2.model_name}',
-                    fontsize=16, fontweight='bold')
-        
-        plt.tight_layout()
+        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
-        
-        print(f"✓ Saved comparison to: {save_path}")
+
+        # Cleanup
+        self.extractor.clear()
+        self.extractor.remove_hooks()
+
+        print(f"  Saved: {save_path}")
 
 
 # ============================================================================
-# Main Execution
+# Batch Visualization (multiple samples)
 # ============================================================================
 
-def main():
-    """Main visualization pipeline"""
-    
-    print("\n" + "="*80)
-    print("ATTENTION MAP & FEATURE VISUALIZATION")
-    print("="*80 + "\n")
-    
-    # Configuration
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    root = "../MHCD_seg"
-    save_dir = "visualizations"
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # Load models
-    print("Loading models...")
-    
-    # UNet++ models
-    unetpp_baseline = UNetPP_B3(n_classes=1)
-    unetpp_dcn = UNetPP_DCNv3_COD(n_classes=1)
-    
-    # UNet3+ models
-    unet3plus_baseline = UNet3Plus_B3(n_classes=1)
-    unet3plus_dcn = UNet3Plus_DCNv3_COD(n_classes=1)
-    
-    # Load weights (if available)
-    #torch.load(ckpt_path, map_location=device)
-    ckpt = torch.load('logs/UNetPP_B3/best_s_measure.pth', map_location=device)
-    if isinstance(ckpt, dict) and "model" in ckpt:
-        unetpp_baseline.load_state_dict(ckpt["model"])
-        print(f"  ✓ Loaded best S-measure")
-    # Case 2: Checkpoint is raw state_dict
-    elif isinstance(ckpt, dict):
-        unetpp_baseline.load_state_dict(ckpt)
-        print(f"  ✓ Loaded state_dict")
-        
-    #unetpp_baseline.load_state_dict(torch.load('logs/UNetPP_B3/best_s_measure.pth', map_location=device)["model"])
-    unetpp_dcn.load_state_dict(torch.load('logs/UNetPP_DCNv3_COD_EfficientNetB3/best_s_measure.pth', map_location=device))
-    unet3plus_baseline.load_state_dict(torch.load('logs/UNet3Plus_B3_20251215_182637/best_s_measure.pth', map_location=device))
-    unet3plus_dcn.load_state_dict(torch.load('logs/UNet3Plus_DCNv3_COD_20251215_182651/best_s_measure.pth', map_location=device))
-    
-    print("✓ Models loaded\n")
-    
-    # Load dataset
-    print("Loading dataset...")
-    dataset = MHCDDataset(root, "val", img_size=352)
-    print(f"✓ Loaded {len(dataset)} validation samples\n")
-    
-    # Select samples to visualize
-    num_samples = 5
-    indices = np.linspace(0, len(dataset)-1, num_samples, dtype=int)
-    
-    print(f"Visualizing {num_samples} samples...\n")
-    
+def visualize_batch(model, dataset, indices, save_dir, device):
+    """Visualize multiple samples from the dataset."""
+    vis = UNet3PlusBEMVisualizer(model, device)
+
     for idx in indices:
         image, mask = dataset[idx]
         image = image.unsqueeze(0)
         mask = mask.unsqueeze(0)
-        
-        print(f"Processing sample {idx}...")
-        
-        # Individual visualizations
-        vis1 = ModelVisualizer(unetpp_baseline, "UNet++_B3", device)
-        vis1.visualize_sample(image, mask, 
-                             f"{save_dir}/sample_{idx}_unetpp_baseline.png")
-        
-        vis2 = ModelVisualizer(unetpp_dcn, "UNet++_DCNv2", device)
-        vis2.visualize_sample(image, mask,
-                             f"{save_dir}/sample_{idx}_unetpp_dcn.png")
-        
-        vis3 = ModelVisualizer(unet3plus_baseline, "UNet3+_B3", device)
-        vis3.visualize_sample(image, mask,
-                             f"{save_dir}/sample_{idx}_unet3plus_baseline.png")
-        
-        vis4 = ModelVisualizer(unet3plus_dcn, "UNet3+_DCNv2", device)
-        vis4.visualize_sample(image, mask,
-                             f"{save_dir}/sample_{idx}_unet3plus_dcn.png")
-        
-        # Comparisons
-        comp1 = ComparisonVisualizer(unetpp_baseline, "UNet++_B3",
-                                     unet3plus_baseline, "UNet3+_B3", device)
-        comp1.compare_sample(image, mask,
-                            f"{save_dir}/sample_{idx}_baseline_comparison.png")
-        
-        comp2 = ComparisonVisualizer(unetpp_dcn, "UNet++_DCNv2",
-                                     unet3plus_dcn, "UNet3+_DCNv2", device)
-        comp2.compare_sample(image, mask,
-                            f"{save_dir}/sample_{idx}_dcn_comparison.png")
-        
-        print(f"  ✓ Sample {idx} complete\n")
-    
-    print("="*80)
-    print("VISUALIZATION COMPLETE")
-    print("="*80)
-    print(f"\nAll visualizations saved to: {save_dir}/")
-    print("\nGenerated files:")
-    print("  - Individual model visualizations (feature maps, offsets)")
-    print("  - Side-by-side comparisons (baseline vs DCN)")
-    print("  - Architecture comparisons (UNet++ vs UNet3+)")
-    print("="*80 + "\n")
+        save_path = os.path.join(save_dir, f"sample_{idx:04d}.png")
+        print(f"Processing sample {idx} ...")
+        vis.visualize_sample(image, mask, save_path)
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Visualize UNet3Plus_B3_BEM features and attention")
+    parser.add_argument('--ckpt', type=str, default=None,
+                        help='Path to model checkpoint (.pth)')
+    parser.add_argument('--root', type=str, default='../MHCD_seg',
+                        help='Dataset root directory')
+    parser.add_argument('--split', type=str, default='val', choices=['train', 'val', 'test'],
+                        help='Dataset split')
+    parser.add_argument('--img_size', type=int, default=352,
+                        help='Input image size')
+    parser.add_argument('--num_samples', type=int, default=5,
+                        help='Number of samples to visualize')
+    parser.add_argument('--save_dir', type=str, default='visualizations',
+                        help='Directory to save output images')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device (cuda or cpu)')
+    args = parser.parse_args()
+
+    device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
+
+    print("\n" + "=" * 70)
+    print("UNet3Plus_B3_BEM  --  Feature & Attention Visualization")
+    print("=" * 70)
+
+    # --- Create model ---
+    print(f"\nCreating UNet3Plus_B3_BEM model ...")
+    model = UNet3Plus_B3_BEM(n_classes=1, predict_boundary=True)
+
+    # --- Load checkpoint ---
+    if args.ckpt and os.path.exists(args.ckpt):
+        print(f"Loading checkpoint: {args.ckpt}")
+        ckpt = torch.load(args.ckpt, map_location=device)
+        if isinstance(ckpt, dict) and 'model' in ckpt:
+            model.load_state_dict(ckpt['model'])
+            epoch = ckpt.get('epoch', '?')
+            best = ckpt.get('best_s_measure', '?')
+            print(f"  Loaded from epoch {epoch}, best S-measure: {best}")
+        elif isinstance(ckpt, dict):
+            model.load_state_dict(ckpt)
+            print(f"  Loaded state_dict")
+        else:
+            print(f"  Warning: unrecognized checkpoint format")
+    else:
+        print("  No checkpoint provided -- using random weights (for structure testing)")
+
+    model = model.to(device).eval()
+
+    # --- Load dataset ---
+    print(f"\nLoading dataset: {args.root} [{args.split}] ...")
+    dataset = MHCDDataset(args.root, args.split, args.img_size)
+    print(f"  Total samples: {len(dataset)}")
+
+    # --- Select samples ---
+    num = min(args.num_samples, len(dataset))
+    indices = np.linspace(0, len(dataset) - 1, num, dtype=int)
+
+    # --- Visualize ---
+    save_dir = os.path.join(args.save_dir, 'UNet3Plus_B3_BEM')
+    os.makedirs(save_dir, exist_ok=True)
+
+    print(f"\nVisualizing {num} samples -> {save_dir}/\n")
+
+    visualize_batch(model, dataset, indices, save_dir, device)
+
+    print("\n" + "=" * 70)
+    print(f"Done. All visualizations saved to: {save_dir}/")
+    print("=" * 70 + "\n")
 
 
 if __name__ == "__main__":
