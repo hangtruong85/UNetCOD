@@ -34,7 +34,7 @@ from metrics.s_measure_paper import s_measure
 from metrics.e_measure_paper import e_measure
 from metrics.f_measure_paper import f_measure
 from metrics.fweighted_measure import fw_measure
-from logger_utils import setup_logger
+from utils.logger import setup_logger
 
 
 # =========================================================

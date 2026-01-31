@@ -2,13 +2,13 @@ import os
 import cv2
 import torch
 import numpy as np
-from models.unetpp_bem import UNetPP_B2_BEM
+from models.unet3plus import UNet3Plus_B3_BEM
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 
 def load_model(weight_path, device="cuda"):
-    model = UNetPP_B2_BEM().to(device)
+    model = UNet3Plus_B3_BEM().to(device)
     ckpt = torch.load(weight_path, map_location=device)
     model.load_state_dict(ckpt)
     model.eval()
