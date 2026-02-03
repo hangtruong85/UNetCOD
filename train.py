@@ -11,29 +11,8 @@ from datetime import datetime
 
 from datasets.mhcd_dataset import MHCDDataset
 
-from models.unetpp import (
-    UNetPP,
-    UNetPP_B3,
-    UNetPP_Resnet50,
-    UNetPP_B3_BEM,
-)
-from models.unet import (
-    UNet,
-    UNet_B3,
-    UNet_Resnet50,
-    UNet_B3_BEM,
-)
-from models.unet3plus import (
-    UNet3Plus,
-    UNet3Plus_ResNet50,
-    UNet3Plus_B0,
-    UNet3Plus_B1,
-    UNet3Plus_B2,
-    UNet3Plus_B3,
-    UNet3Plus_B4,
-    UNet3Plus_B5,
-    UNet3Plus_B3_BEM
-)
+from model_registry import create_model
+
 from metrics.s_measure_paper import s_measure
 from metrics.e_measure_paper import e_measure
 from metrics.fweighted_measure import fw_measure
@@ -41,54 +20,55 @@ from metrics.mae_metric import mae_metric
 from utils.logger import setup_logger
 from loss.losses import SegmentationLoss
 
-
 # ===================== Configuration =====================
 
 class Config:
     """Centralized configuration for training"""
     def __init__(self):
-        # Model selection
-        self.model_name = "UNet3Plus_B3"
+        # Model selection - now with DCN + CBAM + BEM variants!
+        self.model_name = "UNet3Plus_PVT_BEM_CBAM"  # New full model
         
         # Dataset
         self.root = "../MHCD_seg"
-        self.img_size = 352
+        self.img_size = 352  # Increased from 256 - better for COD
         
         # Training
         self.epochs = 120
-        self.batch_size = 12
+        self.batch_size = 12  # Reduced due to larger image size
         self.num_workers = 4
         
         # Optimizer
-        self.lr = 1e-4
+        self.lr_encoder = 1e-5  # Lower LR for pretrained encoder
+        self.lr_dcn = 1e-4      # Higher LR for DCN modules
         self.weight_decay = 1e-4
 
         # Loss weights
         self.lambda_bce = 0.0
         self.lambda_dice = 0.4
         self.lambda_iou = 0.0
-        self.lambda_focal = 0.4  
+        self.lambda_focal = 0.4  # NEW: Focal loss weight
         self.lambda_boundary = 0.3
         
         if "BEM" in self.model_name:
-            self.lambda_boundary = 0.3
-            self.lambda_dice = 0.0
-            self.lambda_focal = 0.0
-            self.lambda_bce = 0.35
-            self.lambda_iou = 0.35
+            self.lambda_boundary = 0.5
+            self.lambda_dice = 0
+            self.lambda_focal = 0
+            self.lambda_bce = 0.25
+            self.lambda_iou = 0.25
         else:
             self.lambda_boundary = 0.0
-            self.lambda_dice = 0.0
-            self.lambda_focal = 0.0
+            self.lambda_dice = 0
+            self.lambda_focal = 0
             self.lambda_bce = 0.5
             self.lambda_iou = 0.5
         
         # Focal loss parameters
-        self.focal_alpha = 0.25
-        self.focal_gamma = 2.0
+        self.focal_alpha = 0.25  # Weight for positive class
+        self.focal_gamma = 2.0   # Focusing parameter
         
         # Training strategy
-        self.warmup_boundary_epochs = 30  # No boundary loss for first N epochs
+        self.warmup_epochs = 10  # Freeze encoder for first N epochs
+        self.warmup_boundary_epochs = 40  # No boundary loss for first N epochs (stabilize segmentation first)
         self.use_cosine_schedule = True
         
         # Device
@@ -106,10 +86,21 @@ def train_epoch(model, loader, optimizer, criterion, scaler, device, config, epo
     Train for one epoch
     
     Training strategy:
+    - Epoch 1-warmup_epochs: Freeze encoder
     - Epoch 1-warmup_boundary_epochs: No boundary loss (focus on segmentation)
     - Epoch warmup_boundary_epochs+: Full training with boundary loss
     """
     model.train()
+    
+    # Freeze encoder during warmup
+    if epoch <= config.warmup_epochs:
+        if hasattr(model, 'backbone') and hasattr(model.backbone, 'encoder'):
+            for param in model.backbone.encoder.parameters():
+                param.requires_grad = False
+    else:
+        if hasattr(model, 'backbone') and hasattr(model.backbone, 'encoder'):
+            for param in model.backbone.encoder.parameters():
+                param.requires_grad = True
     
     total_loss = 0.0
     num_batches = 0
@@ -167,10 +158,10 @@ def validate(model, loader, criterion, device):
     
     metrics = {
         "loss": 0.0,
-        "S": 0.0,
-        "E": 0.0,
-        "Fw": 0.0,
-        "MAE": 0.0
+        "S": 0.0,     # S-measure
+        "E": 0.0,     # E-measure
+        "Fw": 0.0,     # F-measure
+        "MAE": 0.0    # Mean Absolute Error
     }
     
     num_samples = 0
@@ -269,59 +260,70 @@ def plot_training_curves(train_losses, val_losses, val_metrics, save_dir):
     plt.savefig(os.path.join(save_dir, 'training_curves.png'), dpi=150)
     plt.close()
 
-
-# ===================== Model Creation =====================
-
-def create_model(model_name, device):
-    """
-    Create model based on name
-    """
-    model_dict = {     
-        # UNet++ with BEM
-        "UNetPP": UNetPP,
-        "UNetPP_B3": UNetPP_B3,
-        "UNetPP_Resnet50": UNetPP_Resnet50,
-        "UNetPP_B3_BEM": UNetPP_B3_BEM,
-        # UNet with BEM
-        "UNet": UNet,
-        "UNet_B3": UNet_B3,
-        "UNet_Resnet50": UNet_Resnet50,
-        "UNet_B3_BEM": UNet_B3_BEM,
-        # UNet3+ with BEM
-        "UNet3Plus": UNet3Plus, 
-        "UNet3Plus_ResNet50": UNet3Plus_ResNet50,
-        "UNet3Plus_B0": UNet3Plus_B0,
-        "UNet3Plus_B1": UNet3Plus_B1,
-        "UNet3Plus_B2": UNet3Plus_B2,
-        "UNet3Plus_B3": UNet3Plus_B3,
-        "UNet3Plus_B4": UNet3Plus_B4,
-        "UNet3Plus_B5": UNet3Plus_B5,
-        "UNet3Plus_B3_BEM": UNet3Plus_B3_BEM,
-    }
-    
-    if model_name not in model_dict:
-        raise ValueError(f"Unknown model: {model_name}. Available: {list(model_dict.keys())}")
-    
-    model = model_dict[model_name]().to(device)
-    return model
-
-
 # ===================== Optimizer Creation =====================
 
 def create_optimizer(model, config):
     """
-    Create optimizer with uniform learning rate
+    Create optimizer with different learning rates for different parts
     """
+    # Separate encoder, DCN, CBAM, and other parameters
+    encoder_params = []
+    dcn_params = []
+    cbam_params = []
+    other_params = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        
+        if 'backbone.encoder' in name:
+            encoder_params.append(param)
+        elif 'dcn' in name.lower():
+            dcn_params.append(param)
+        elif 'cbam' in name.lower() or 'channel_attention' in name or 'spatial_attention' in name:
+            cbam_params.append(param)
+        else:
+            other_params.append(param)
+    
+    # Create parameter groups
+    param_groups = []
+    
+    if encoder_params:
+        param_groups.append({
+            'params': encoder_params,
+            'lr': config.lr_encoder,
+            'name': 'encoder'
+        })
+        print(f"  Encoder params: {len(encoder_params)} tensors, LR={config.lr_encoder}")
+    
+    if dcn_params:
+        param_groups.append({
+            'params': dcn_params,
+            'lr': config.lr_dcn,
+            'name': 'dcn'
+        })
+        print(f"  DCN params: {len(dcn_params)} tensors, LR={config.lr_dcn}")
+    
+    if cbam_params:
+        param_groups.append({
+            'params': cbam_params,
+            'lr': config.lr_dcn,  # Same as DCN
+            'name': 'cbam'
+        })
+        print(f"  CBAM params: {len(cbam_params)} tensors, LR={config.lr_dcn}")
+    
+    if other_params:
+        param_groups.append({
+            'params': other_params,
+            'lr': config.lr_dcn,
+            'name': 'other'
+        })
+        print(f"  Other params: {len(other_params)} tensors, LR={config.lr_dcn}")
+    
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.lr,
+        param_groups,
         weight_decay=config.weight_decay
     )
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Total parameters    : {total_params:,}")
-    print(f"  Trainable parameters: {trainable_params:,}")
     
     return optimizer
 
@@ -365,9 +367,10 @@ def main():
     logger.info(f"Image Size    : {config.img_size}")
     logger.info(f"Batch Size    : {config.batch_size}")
     logger.info(f"Epochs        : {config.epochs}")
+    logger.info(f"Warmup Epochs : {config.warmup_epochs}")
     logger.info(f"Warmup Boundary Epochs: {config.warmup_boundary_epochs}")
-    logger.info(f"Learning Rate : {config.lr}")
-    logger.info(f"Weight Decay  : {config.weight_decay}")
+    logger.info(f"LR Encoder    : {config.lr_encoder}")
+    logger.info(f"LR DCN        : {config.lr_dcn}")
     logger.info(f"Loss Weights  : BCE={config.lambda_bce}, Dice={config.lambda_dice}, "
                 f"IoU={config.lambda_iou}, Focal={config.lambda_focal}, Boundary={config.lambda_boundary}")
     logger.info(f"Focal Params  : alpha={config.focal_alpha}, gamma={config.focal_gamma}")
@@ -464,6 +467,10 @@ def main():
         logger.info(f"\n{'='*80}")
         logger.info(f"EPOCH {epoch}/{config.epochs}")
         logger.info(f"{'='*80}")
+        
+        # Training phase
+        if epoch <= config.warmup_epochs:
+            logger.info(f"[WARMUP] Encoder frozen, training attention modules only")
         
         train_loss = train_epoch(model, train_loader, optimizer, criterion, scaler, config.device, config, epoch)
         train_losses.append(train_loss)

@@ -95,5 +95,9 @@ class BoundaryEnhancementModule(nn.Module):
         
         # Gradient magnitude
         boundary = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+
+        # Normalize to [0, 1]
+        boundary = boundary / (boundary.max() + 1e-8)  # OR
+        boundary = torch.clamp(boundary, 0, 1)
         
         return boundary
