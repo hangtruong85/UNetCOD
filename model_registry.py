@@ -38,14 +38,6 @@ from models.unet3plus import (
     UNet3Plus_B3_BEM_CBAM
 )
 
-# UNet3+ models
-from models.unet3plus_pvt import (
-    UNet3Plus_PVT,
-    UNet3Plus_PVT_BEM,
-    UNet3Plus_PVT_CBAM,
-    UNet3Plus_PVT_BEM_CBAM,
-)
-
 # ===================== Model Dictionary =====================
 
 MODEL_DICT = {     
@@ -73,13 +65,7 @@ MODEL_DICT = {
     
     # UNet3+ with BEM
     "UNet3Plus_B3_BEM": UNet3Plus_B3_BEM,
-    "UNet3Plus_B3_BEM_CBAM": UNet3Plus_B3_BEM_CBAM,
-
-    # PVT thêm BEM và CBAM
-    "UNet3Plus_PVT": UNet3Plus_PVT,
-    "UNet3Plus_PVT_BEM": UNet3Plus_PVT_BEM,
-    "UNet3Plus_PVT_CBAM": UNet3Plus_PVT_CBAM,
-    "UNet3Plus_PVT_BEM_CBAM": UNet3Plus_PVT_BEM_CBAM,
+    "UNet3Plus_B3_BEM_CBAM": UNet3Plus_B3_BEM_CBAM
 }
 
 
@@ -140,7 +126,6 @@ def print_available_models():
         "UNet": [k for k in MODEL_DICT.keys() if k.startswith("UNet") and not k.startswith("UNetPP") and not k.startswith("UNet3")],
         "UNet3+ (Baseline)": [k for k in MODEL_DICT.keys() if k.startswith("UNet3Plus") and "BEM" not in k and "PVT" not in k],
         "UNet3+ (with BEM)": [k for k in MODEL_DICT.keys() if k.startswith("UNet3Plus") and "BEM" in k],
-        "UNet3+ (with PVT-V2)": [k for k in MODEL_DICT.keys() if "PVT" in k],
     }
     
     for category, models in models_by_category.items():

@@ -12,6 +12,15 @@ from .cbam import CBAM
 """
 UNet3+ Decoder Block for full-scale skip connections
 Aggregates features from ALL encoder levels
+
+According to original paper: https://arxiv.org/abs/2004.08790
+Full-scale skip connection pattern:
+- d4 = e1 + e2 + e3 + e4 + e5
+- d3 = e1 + e2 + e3 + d4 + e5  (NOT e4!)
+- d2 = e1 + e2 + d3 + d4 + e5  (NOT e3, e4!)
+- d1 = e1 + d2 + d3 + d4 + e5  (NOT e2, e3, e4!)
+
+Key insight: e5 (deepest encoder) is used in ALL decoder levels
 """
 class UNet3PlusDecoderBlock(nn.Module):
     """
@@ -92,11 +101,17 @@ class UNet3Plus(nn.Module):
     """
     UNet3+ with baseline encoder 
     Full-scale skip connections for better feature aggregation
+    
+    CORRECT pattern according to original paper:
+    - d4 = e1 + e2 + e3 + e4 + e5
+    - d3 = e1 + e2 + e3 + d4 + e5
+    - d2 = e1 + e2 + d3 + d4 + e5
+    - d1 = e1 + d2 + d3 + d4 + e5
     """
     def __init__(self, n_classes=1, encoder="resnet34"):
         super().__init__()
         
-        # EfficientNet-B3 encoder
+        # Encoder
         self.encoder = smp.encoders.get_encoder(
             name=encoder,
             in_channels=3,
@@ -104,7 +119,7 @@ class UNet3Plus(nn.Module):
             weights="imagenet"
         )
         
-        # Encoder output channels: [3, 40, 32, 48, 136, 384]
+        # Encoder output channels
         encoder_channels = self.encoder.out_channels
         
         # Decoder channels (progressively decrease)
@@ -113,32 +128,52 @@ class UNet3Plus(nn.Module):
         # UNet3+ decoder blocks (4 decoder levels)
         # Each block aggregates features from ALL encoder levels
         
-        # Decoder 4 (deepest): aggregate from e1, e2, e3, e4, e5
+        # Decoder 4 (deepest): d4 = e1 + e2 + e3 + e4 + e5
         self.decoder4 = UNet3PlusDecoderBlock(
-            in_channels_list=[encoder_channels[1], encoder_channels[2], encoder_channels[3], encoder_channels[4], encoder_channels[5]],
-            out_channels=decoder_channels,
-            use_dcn=False
+            in_channels_list=[
+                encoder_channels[1],  # e1
+                encoder_channels[2],  # e2
+                encoder_channels[3],  # e3
+                encoder_channels[4],  # e4
+                encoder_channels[5]   # e5
+            ],
+            out_channels=decoder_channels
         )
         
-        # Decoder 3: aggregate from e1, e2, e3, e4, d4
+        # Decoder 3: d3 = e1 + e2 + e3 + d4 + e5
         self.decoder3 = UNet3PlusDecoderBlock(
-            in_channels_list=[encoder_channels[1], encoder_channels[2], encoder_channels[3], encoder_channels[4], decoder_channels],
-            out_channels=decoder_channels,
-            use_dcn=False
+            in_channels_list=[
+                encoder_channels[1],  # e1
+                encoder_channels[2],  # e2
+                encoder_channels[3],  # e3
+                decoder_channels,     # d4 (NOT e4!)
+                encoder_channels[5]   # e5 (always present!)
+            ],
+            out_channels=decoder_channels
         )
         
-        # Decoder 2: aggregate from e1, e2, e3, d3, d4
+        # Decoder 2: d2 = e1 + e2 + d3 + d4 + e5
         self.decoder2 = UNet3PlusDecoderBlock(
-            in_channels_list=[encoder_channels[1], encoder_channels[2], encoder_channels[3], decoder_channels, decoder_channels],
-            out_channels=decoder_channels,
-            use_dcn=False
+            in_channels_list=[
+                encoder_channels[1],  # e1
+                encoder_channels[2],  # e2
+                decoder_channels,     # d3 (NOT e3!)
+                decoder_channels,     # d4
+                encoder_channels[5]   # e5 (always present!)
+            ],
+            out_channels=decoder_channels
         )
         
-        # Decoder 1: aggregate from e1, e2, d2, d3, d4
+        # Decoder 1: d1 = e1 + d2 + d3 + d4 + e5
         self.decoder1 = UNet3PlusDecoderBlock(
-            in_channels_list=[encoder_channels[1], encoder_channels[2], decoder_channels, decoder_channels, decoder_channels],
-            out_channels=decoder_channels,
-            use_dcn=False
+            in_channels_list=[
+                encoder_channels[1],  # e1
+                decoder_channels,     # d2 (NOT e2!)
+                decoder_channels,     # d3
+                decoder_channels,     # d4
+                encoder_channels[5]   # e5 (always present!)
+            ],
+            out_channels=decoder_channels
         )
         
         # Segmentation head
@@ -149,24 +184,25 @@ class UNet3Plus(nn.Module):
         
         # Encoder
         features = self.encoder(x)  # [e0, e1, e2, e3, e4, e5]
+        e1, e2, e3, e4, e5 = features[1], features[2], features[3], features[4], features[5]
         
         # Calculate target sizes for each decoder level
-        size_d4 = (features[4].shape[2], features[4].shape[3])  # Same as e4
-        size_d3 = (features[3].shape[2], features[3].shape[3])  # Same as e3
-        size_d2 = (features[2].shape[2], features[2].shape[3])  # Same as e2
-        size_d1 = (features[1].shape[2], features[1].shape[3])  # Same as e1
+        size_d4 = (e4.shape[2], e4.shape[3])  # Same as e4
+        size_d3 = (e3.shape[2], e3.shape[3])  # Same as e3
+        size_d2 = (e2.shape[2], e2.shape[3])  # Same as e2
+        size_d1 = (e1.shape[2], e1.shape[3])  # Same as e1
         
-        # Decoder 4
-        d4 = self.decoder4([features[1], features[2], features[3], features[4], features[5]], size_d4)
+        # Decoder 4: d4 = e1 + e2 + e3 + e4 + e5
+        d4 = self.decoder4([e1, e2, e3, e4, e5], size_d4)
         
-        # Decoder 3
-        d3 = self.decoder3([features[1], features[2], features[3], features[4], d4], size_d3)
+        # Decoder 3: d3 = e1 + e2 + e3 + d4 + e5
+        d3 = self.decoder3([e1, e2, e3, d4, e5], size_d3)
         
-        # Decoder 2
-        d2 = self.decoder2([features[1], features[2], features[3], d3, d4], size_d2)
+        # Decoder 2: d2 = e1 + e2 + d3 + d4 + e5
+        d2 = self.decoder2([e1, e2, d3, d4, e5], size_d2)
         
-        # Decoder 1
-        d1 = self.decoder1([features[1], features[2], d2, d3, d4], size_d1)
+        # Decoder 1: d1 = e1 + d2 + d3 + d4 + e5
+        d1 = self.decoder1([e1, d2, d3, d4, e5], size_d1)
         
         # Upsample to input size
         d1 = F.interpolate(d1, size=input_size, mode='bilinear', align_corners=True)
@@ -178,8 +214,14 @@ class UNet3Plus(nn.Module):
 
 class UNet3Plus_B3(nn.Module):
     """
-    UNet3+ with baseline encoder 
+    UNet3+ with EfficientNet-B3 encoder
     Full-scale skip connections for better feature aggregation
+    
+    CORRECT pattern according to original paper:
+    - d4 = e1 + e2 + e3 + e4 + e5
+    - d3 = e1 + e2 + e3 + d4 + e5
+    - d2 = e1 + e2 + d3 + d4 + e5
+    - d1 = e1 + d2 + d3 + d4 + e5
     """
     def __init__(self, n_classes=1, encoder="efficientnet-b3"):
         super().__init__()
@@ -201,32 +243,52 @@ class UNet3Plus_B3(nn.Module):
         # UNet3+ decoder blocks (4 decoder levels)
         # Each block aggregates features from ALL encoder levels
         
-        # Decoder 4 (deepest): aggregate from e1, e2, e3, e4, e5
+        # Decoder 4 (deepest): d4 = e1 + e2 + e3 + e4 + e5
         self.decoder4 = UNet3PlusDecoderBlock(
-            in_channels_list=[encoder_channels[1], encoder_channels[2], encoder_channels[3], encoder_channels[4], encoder_channels[5]],
-            out_channels=decoder_channels,
-            use_dcn=False
+            in_channels_list=[
+                encoder_channels[1],  # e1
+                encoder_channels[2],  # e2
+                encoder_channels[3],  # e3
+                encoder_channels[4],  # e4
+                encoder_channels[5]   # e5
+            ],
+            out_channels=decoder_channels
         )
         
-        # Decoder 3: aggregate from e1, e2, e3, e4, d4
+        # Decoder 3: d3 = e1 + e2 + e3 + d4 + e5
         self.decoder3 = UNet3PlusDecoderBlock(
-            in_channels_list=[encoder_channels[1], encoder_channels[2], encoder_channels[3], encoder_channels[4], decoder_channels],
-            out_channels=decoder_channels,
-            use_dcn=False
+            in_channels_list=[
+                encoder_channels[1],  # e1
+                encoder_channels[2],  # e2
+                encoder_channels[3],  # e3
+                decoder_channels,     # d4 (NOT e4!)
+                encoder_channels[5]   # e5 (always present!)
+            ],
+            out_channels=decoder_channels
         )
         
-        # Decoder 2: aggregate from e1, e2, e3, d3, d4
+        # Decoder 2: d2 = e1 + e2 + d3 + d4 + e5
         self.decoder2 = UNet3PlusDecoderBlock(
-            in_channels_list=[encoder_channels[1], encoder_channels[2], encoder_channels[3], decoder_channels, decoder_channels],
-            out_channels=decoder_channels,
-            use_dcn=False
+            in_channels_list=[
+                encoder_channels[1],  # e1
+                encoder_channels[2],  # e2
+                decoder_channels,     # d3 (NOT e3!)
+                decoder_channels,     # d4
+                encoder_channels[5]   # e5 (always present!)
+            ],
+            out_channels=decoder_channels
         )
         
-        # Decoder 1: aggregate from e1, e2, d2, d3, d4
+        # Decoder 1: d1 = e1 + d2 + d3 + d4 + e5
         self.decoder1 = UNet3PlusDecoderBlock(
-            in_channels_list=[encoder_channels[1], encoder_channels[2], decoder_channels, decoder_channels, decoder_channels],
-            out_channels=decoder_channels,
-            use_dcn=False
+            in_channels_list=[
+                encoder_channels[1],  # e1
+                decoder_channels,     # d2 (NOT e2!)
+                decoder_channels,     # d3
+                decoder_channels,     # d4
+                encoder_channels[5]   # e5 (always present!)
+            ],
+            out_channels=decoder_channels
         )
         
         # Segmentation head
@@ -237,24 +299,25 @@ class UNet3Plus_B3(nn.Module):
         
         # Encoder
         features = self.encoder(x)  # [e0, e1, e2, e3, e4, e5]
+        e1, e2, e3, e4, e5 = features[1], features[2], features[3], features[4], features[5]
         
         # Calculate target sizes for each decoder level
-        size_d4 = (features[4].shape[2], features[4].shape[3])  # Same as e4
-        size_d3 = (features[3].shape[2], features[3].shape[3])  # Same as e3
-        size_d2 = (features[2].shape[2], features[2].shape[3])  # Same as e2
-        size_d1 = (features[1].shape[2], features[1].shape[3])  # Same as e1
+        size_d4 = (e4.shape[2], e4.shape[3])  # Same as e4
+        size_d3 = (e3.shape[2], e3.shape[3])  # Same as e3
+        size_d2 = (e2.shape[2], e2.shape[3])  # Same as e2
+        size_d1 = (e1.shape[2], e1.shape[3])  # Same as e1
         
-        # Decoder 4
-        d4 = self.decoder4([features[1], features[2], features[3], features[4], features[5]], size_d4)
+        # Decoder 4: d4 = e1 + e2 + e3 + e4 + e5
+        d4 = self.decoder4([e1, e2, e3, e4, e5], size_d4)
         
-        # Decoder 3
-        d3 = self.decoder3([features[1], features[2], features[3], features[4], d4], size_d3)
+        # Decoder 3: d3 = e1 + e2 + e3 + d4 + e5
+        d3 = self.decoder3([e1, e2, e3, d4, e5], size_d3)
         
-        # Decoder 2
-        d2 = self.decoder2([features[1], features[2], features[3], d3, d4], size_d2)
+        # Decoder 2: d2 = e1 + e2 + d3 + d4 + e5
+        d2 = self.decoder2([e1, e2, d3, d4, e5], size_d2)
         
-        # Decoder 1
-        d1 = self.decoder1([features[1], features[2], d2, d3, d4], size_d1)
+        # Decoder 1: d1 = e1 + d2 + d3 + d4 + e5
+        d1 = self.decoder1([e1, d2, d3, d4, e5], size_d1)
         
         # Upsample to input size
         d1 = F.interpolate(d1, size=input_size, mode='bilinear', align_corners=True)
@@ -319,8 +382,14 @@ class UNet3Plus_ResNet50(nn.Module):
 
 class UNet3Plus_B3_BEM(nn.Module):
     """
-    UNet3+ with EfficientNet-B3 encoder (Baseline - no DCN)
+    UNet3+ with EfficientNet-B3 encoder + BEM
     Full-scale skip connections for better feature aggregation
+    
+    CORRECT pattern according to original paper:
+    - d4 = e1 + e2 + e3 + e4 + e5
+    - d3 = e1 + e2 + e3 + d4 + e5
+    - d2 = e1 + e2 + d3 + d4 + e5
+    - d1 = e1 + d2 + d3 + d4 + e5
     """
     def __init__(self, n_classes=1, encoder="efficientnet-b3", predict_boundary=True):
         super().__init__()
@@ -342,27 +411,51 @@ class UNet3Plus_B3_BEM(nn.Module):
         # UNet3+ decoder blocks (4 decoder levels)
         # Each block aggregates features from ALL encoder levels
         
-        # Decoder 4 (deepest): aggregate from e1, e2, e3, e4, e5
+        # Decoder 4 (deepest): d4 = e1 + e2 + e3 + e4 + e5
         self.decoder4 = UNet3PlusDecoderBlock(
-            in_channels_list=[encoder_channels[1], encoder_channels[2], encoder_channels[3], encoder_channels[4], encoder_channels[5]],
+            in_channels_list=[
+                encoder_channels[1],  # e1
+                encoder_channels[2],  # e2
+                encoder_channels[3],  # e3
+                encoder_channels[4],  # e4
+                encoder_channels[5]   # e5
+            ],
             out_channels=decoder_channels
         )
         
-        # Decoder 3: aggregate from e1, e2, e3, e4, d4
+        # Decoder 3: d3 = e1 + e2 + e3 + d4 + e5
         self.decoder3 = UNet3PlusDecoderBlock(
-            in_channels_list=[encoder_channels[1], encoder_channels[2], encoder_channels[3], encoder_channels[4], decoder_channels],
+            in_channels_list=[
+                encoder_channels[1],  # e1
+                encoder_channels[2],  # e2
+                encoder_channels[3],  # e3
+                decoder_channels,     # d4 (NOT e4!)
+                encoder_channels[5]   # e5 (always present!)
+            ],
             out_channels=decoder_channels
         )
         
-        # Decoder 2: aggregate from e1, e2, e3, d3, d4
+        # Decoder 2: d2 = e1 + e2 + d3 + d4 + e5
         self.decoder2 = UNet3PlusDecoderBlock(
-            in_channels_list=[encoder_channels[1], encoder_channels[2], encoder_channels[3], decoder_channels, decoder_channels],
+            in_channels_list=[
+                encoder_channels[1],  # e1
+                encoder_channels[2],  # e2
+                decoder_channels,     # d3 (NOT e3!)
+                decoder_channels,     # d4
+                encoder_channels[5]   # e5 (always present!)
+            ],
             out_channels=decoder_channels
         )
         
-        # Decoder 1: aggregate from e1, e2, d2, d3, d4
+        # Decoder 1: d1 = e1 + d2 + d3 + d4 + e5
         self.decoder1 = UNet3PlusDecoderBlock(
-            in_channels_list=[encoder_channels[1], encoder_channels[2], decoder_channels, decoder_channels, decoder_channels],
+            in_channels_list=[
+                encoder_channels[1],  # e1
+                decoder_channels,     # d2 (NOT e2!)
+                decoder_channels,     # d3
+                decoder_channels,     # d4
+                encoder_channels[5]   # e5 (always present!)
+            ],
             out_channels=decoder_channels
         )
         
@@ -379,24 +472,25 @@ class UNet3Plus_B3_BEM(nn.Module):
         
         # Encoder
         features = self.encoder(x)  # [e0, e1, e2, e3, e4, e5]
+        e1, e2, e3, e4, e5 = features[1], features[2], features[3], features[4], features[5]
         
         # Calculate target sizes for each decoder level
-        size_d4 = (features[4].shape[2], features[4].shape[3])  # Same as e4
-        size_d3 = (features[3].shape[2], features[3].shape[3])  # Same as e3
-        size_d2 = (features[2].shape[2], features[2].shape[3])  # Same as e2
-        size_d1 = (features[1].shape[2], features[1].shape[3])  # Same as e1
+        size_d4 = (e4.shape[2], e4.shape[3])  # Same as e4
+        size_d3 = (e3.shape[2], e3.shape[3])  # Same as e3
+        size_d2 = (e2.shape[2], e2.shape[3])  # Same as e2
+        size_d1 = (e1.shape[2], e1.shape[3])  # Same as e1
         
-        # Decoder 4
-        d4 = self.decoder4([features[1], features[2], features[3], features[4], features[5]], size_d4)
+        # Decoder 4: d4 = e1 + e2 + e3 + e4 + e5
+        d4 = self.decoder4([e1, e2, e3, e4, e5], size_d4)
         
-        # Decoder 3
-        d3 = self.decoder3([features[1], features[2], features[3], features[4], d4], size_d3)
+        # Decoder 3: d3 = e1 + e2 + e3 + d4 + e5
+        d3 = self.decoder3([e1, e2, e3, d4, e5], size_d3)
         
-        # Decoder 2
-        d2 = self.decoder2([features[1], features[2], features[3], d3, d4], size_d2)
+        # Decoder 2: d2 = e1 + e2 + d3 + d4 + e5
+        d2 = self.decoder2([e1, e2, d3, d4, e5], size_d2)
         
-        # Decoder 1
-        d1 = self.decoder1([features[1], features[2], d2, d3, d4], size_d1)
+        # Decoder 1: d1 = e1 + d2 + d3 + d4 + e5
+        d1 = self.decoder1([e1, d2, d3, d4, e5], size_d1)
         
         # Upsample to input size
         d1 = F.interpolate(d1, size=input_size, mode='bilinear', align_corners=True)
@@ -437,6 +531,12 @@ class UNet3Plus_B3_BEM_CBAM(nn.Module):
     
     - BEM: Boundary Enhancement Module
       └─ Optional boundary prediction for improved boundary quality
+    
+    CORRECT pattern according to original paper:
+    - d4 = e1 + e2 + e3 + e4 + e5
+    - d3 = e1 + e2 + e3 + d4 + e5
+    - d2 = e1 + e2 + d3 + d4 + e5
+    - d1 = e1 + d2 + d3 + d4 + e5
     
     Args:
         n_classes: Number of output classes (default: 1)
@@ -485,7 +585,7 @@ class UNet3Plus_B3_BEM_CBAM(nn.Module):
         # UNet3+ decoder blocks (4 decoder levels)
         # Each block aggregates features from ALL encoder levels
         
-        # Decoder 4 (deepest): aggregate from e1, e2, e3, e4, e5
+        # Decoder 4 (deepest): d4 = e1 + e2 + e3 + e4 + e5
         self.decoder4 = UNet3PlusDecoderBlock(
             in_channels_list=[
                 encoder_channels[1],  # e1: 40
@@ -497,38 +597,38 @@ class UNet3Plus_B3_BEM_CBAM(nn.Module):
             out_channels=decoder_channels
         )
         
-        # Decoder 3: aggregate from e1, e2, e3, e4, d4
+        # Decoder 3: d3 = e1 + e2 + e3 + d4 + e5
         self.decoder3 = UNet3PlusDecoderBlock(
             in_channels_list=[
                 encoder_channels[1],  # e1: 40
                 encoder_channels[2],  # e2: 32
                 encoder_channels[3],  # e3: 48
-                encoder_channels[4],  # e4: 136
-                decoder_channels      # d4: 64
+                decoder_channels,     # d4: 64 (NOT e4!)
+                encoder_channels[5]   # e5: 384 (always present!)
             ],
             out_channels=decoder_channels
         )
         
-        # Decoder 2: aggregate from e1, e2, e3, d3, d4
+        # Decoder 2: d2 = e1 + e2 + d3 + d4 + e5
         self.decoder2 = UNet3PlusDecoderBlock(
             in_channels_list=[
                 encoder_channels[1],  # e1: 40
                 encoder_channels[2],  # e2: 32
-                encoder_channels[3],  # e3: 48
-                decoder_channels,     # d3: 64
-                decoder_channels      # d4: 64
+                decoder_channels,     # d3: 64 (NOT e3!)
+                decoder_channels,     # d4: 64
+                encoder_channels[5]   # e5: 384 (always present!)
             ],
             out_channels=decoder_channels
         )
         
-        # Decoder 1: aggregate from e1, e2, d2, d3, d4
+        # Decoder 1: d1 = e1 + d2 + d3 + d4 + e5
         self.decoder1 = UNet3PlusDecoderBlock(
             in_channels_list=[
                 encoder_channels[1],  # e1: 40
-                encoder_channels[2],  # e2: 32
-                decoder_channels,     # d2: 64
+                decoder_channels,     # d2: 64 (NOT e2!)
                 decoder_channels,     # d3: 64
-                decoder_channels      # d4: 64
+                decoder_channels,     # d4: 64
+                encoder_channels[5]   # e5: 384 (always present!)
             ],
             out_channels=decoder_channels
         )
@@ -562,73 +662,30 @@ class UNet3Plus_B3_BEM_CBAM(nn.Module):
         
         # Apply CBAM to stages 4 & 5 (deep semantic features)
         # This enhances important features and suppresses noise
-        features_with_cbam = [
-            features[0],                    # e0: input (no CBAM)
-            features[1],                    # e1: 40 channels (no CBAM)
-            features[2],                    # e2: 32 channels (no CBAM)
-            features[3],                    # e3: 48 channels (no CBAM)
-            self.cbam_stage4(features[4]),  # e4: 136 channels → CBAM
-            self.cbam_stage5(features[5])   # e5: 384 channels → CBAM
-        ]
+        e1 = features[1]                    # e1: 40 channels (no CBAM)
+        e2 = features[2]                    # e2: 32 channels (no CBAM)
+        e3 = features[3]                    # e3: 48 channels (no CBAM)
+        e4 = self.cbam_stage4(features[4])  # e4: 136 channels → CBAM
+        e5 = self.cbam_stage5(features[5])  # e5: 384 channels → CBAM
         
         # ===================== DECODER FORWARD =====================
         # Calculate target sizes for each decoder level
-        size_d4 = (features_with_cbam[4].shape[2], features_with_cbam[4].shape[3])  # 1/8
-        size_d3 = (features_with_cbam[3].shape[2], features_with_cbam[3].shape[3])  # 1/4
-        size_d2 = (features_with_cbam[2].shape[2], features_with_cbam[2].shape[3])  # 1/2
-        size_d1 = (features_with_cbam[1].shape[2], features_with_cbam[1].shape[3])  # 1/1
+        size_d4 = (e4.shape[2], e4.shape[3])  # 1/8
+        size_d3 = (e3.shape[2], e3.shape[3])  # 1/4
+        size_d2 = (e2.shape[2], e2.shape[3])  # 1/2
+        size_d1 = (e1.shape[2], e1.shape[3])  # 1/1
         
-        # Decoder 4 (deepest)
-        # Aggregates all 5 encoder levels
-        d4 = self.decoder4(
-            [
-                features_with_cbam[1],  # e1
-                features_with_cbam[2],  # e2
-                features_with_cbam[3],  # e3
-                features_with_cbam[4],  # e4 (with CBAM)
-                features_with_cbam[5]   # e5 (with CBAM)
-            ],
-            size_d4
-        )
+        # Decoder 4 (deepest): d4 = e1 + e2 + e3 + e4 + e5
+        d4 = self.decoder4([e1, e2, e3, e4, e5], size_d4)
         
-        # Decoder 3
-        # Aggregates e1, e2, e3, e4, d4
-        d3 = self.decoder3(
-            [
-                features_with_cbam[1],  # e1
-                features_with_cbam[2],  # e2
-                features_with_cbam[3],  # e3
-                features_with_cbam[4],  # e4 (with CBAM)
-                d4                      # d4
-            ],
-            size_d3
-        )
+        # Decoder 3: d3 = e1 + e2 + e3 + d4 + e5
+        d3 = self.decoder3([e1, e2, e3, d4, e5], size_d3)
         
-        # Decoder 2
-        # Aggregates e1, e2, e3, d3, d4
-        d2 = self.decoder2(
-            [
-                features_with_cbam[1],  # e1
-                features_with_cbam[2],  # e2
-                features_with_cbam[3],  # e3
-                d3,                     # d3
-                d4                      # d4
-            ],
-            size_d2
-        )
+        # Decoder 2: d2 = e1 + e2 + d3 + d4 + e5
+        d2 = self.decoder2([e1, e2, d3, d4, e5], size_d2)
         
-        # Decoder 1 (shallowest)
-        # Aggregates e1, e2, d2, d3, d4
-        d1 = self.decoder1(
-            [
-                features_with_cbam[1],  # e1
-                features_with_cbam[2],  # e2
-                d2,                     # d2
-                d3,                     # d3
-                d4                      # d4
-            ],
-            size_d1
-        )
+        # Decoder 1 (shallowest): d1 = e1 + d2 + d3 + d4 + e5
+        d1 = self.decoder1([e1, d2, d3, d4, e5], size_d1)
         
         # Upsample to input size
         d1 = F.interpolate(d1, size=input_size, mode='bilinear', align_corners=True)
@@ -648,4 +705,3 @@ class UNet3Plus_B3_BEM_CBAM(nn.Module):
             return mask, boundary_pred
         else:
             return mask
-       
