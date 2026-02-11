@@ -24,10 +24,10 @@ class EvalConfig:
     """Evaluation configuration"""
     def __init__(self):
         # Model to evaluate
-        self.model_name = "UNet3Plus_B3_BEM_CBAM"
+        self.model_name = "UNet3Plus_B3_CBAM"
         
         # Checkpoint path
-        self.ckpt_path = "logs/UNet3Plus_B3_BEM_CBAM_20260205_172906/best_s_measure.pth"
+        self.ckpt_path = "logs/UNet3Plus_B3_CBAM_20260211_153433/best_s_measure.pth"
         
         # Dataset
         self.root = "../MHCD_seg"

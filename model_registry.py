@@ -35,6 +35,7 @@ from models.unet3plus import (
     UNet3Plus_B4,
     UNet3Plus_B5,
     UNet3Plus_B3_BEM,
+    UNet3Plus_B3_CBAM,
     UNet3Plus_B3_BEM_CBAM
 )
 
@@ -65,6 +66,7 @@ MODEL_DICT = {
     
     # UNet3+ with BEM
     "UNet3Plus_B3_BEM": UNet3Plus_B3_BEM,
+    "UNet3Plus_B3_CBAM": UNet3Plus_B3_CBAM,
     "UNet3Plus_B3_BEM_CBAM": UNet3Plus_B3_BEM_CBAM
 }
 

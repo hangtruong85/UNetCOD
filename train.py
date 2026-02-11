@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 from torch.amp import autocast
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from datetime import datetime
@@ -27,7 +27,7 @@ class Config:
     """Centralized configuration for training"""
     def __init__(self):
         # Model selection - now with DCN + CBAM + BEM variants!
-        self.model_name = "UNet3Plus_B3_BEM_CBAM"  # New full model
+        self.model_name = "UNet3Plus_B3_BEM"  # New full model
         
         # Dataset
         self.root = "../MHCD_seg"
