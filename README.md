@@ -10,17 +10,22 @@
 > *UNETCOD: An Efficient UNet3+ Framework with Dual-Attention and Boundary Enhancement for Military Camouflage Segmentation*
 
 **Authors:**
-- **Thi-Thu-Hang Truong**¹·* *(Corresponding author)*
+- **Thi-Thu-Hang Truong**¹
 - **Trung-Kien Tran**¹
-- **Hai-Hong Phan**²
+- **Anh-Tuan Nguyen**²
+- **Hai-Hong Phan**³·* *(Corresponding author)*
+- **Thai-Hung Vo**⁴
+- **Thi-Hien Ha**³
 
 **Affiliations:**
 - ¹ Institute of Information Technology and Electronics, Academy of Military Science and Technology
-- ² Institute of Information and Communication Technology, Le Quy Don Technical University
+- ² Institute of Defense Equipment, Academy of Military Science and Technology
+- ³ Institute of Information and Communication Technology, Le Quy Don Technical University
+- ⁴ Department of Military Science, Ministry of National Defense of Vietnam
 
 **Contact:** t3hang.miti@gmail.com
 
-> 📝 *This paper is currently under review (2026).*
+> ✅ *Accepted for publication in **JST-ICT Vol. 15, No. 01, June 2026** — Journal of Science and Technology: Information and Communication Technology, Le Quy Don Technical University.*
 
 ---
 
@@ -37,7 +42,10 @@ If you find this code useful in your research, please consider citing our paper:
 ```bibtex
 @article{truong2026unetcod,
   title     = {UNETCOD: An Efficient UNet3+ Framework with Dual-Attention and Boundary Enhancement for Military Camouflage Segmentation},
-  author    = {Thi-Thu-Hang Truong and Trung-Kien Tran and Hai-Hong Phan},
+  author    = {Thi-Thu-Hang Truong and Trung-Kien Tran and Anh-Tuan Nguyen and Hai-Hong Phan and Thai-Hung Vo and Thi-Hien Ha},
+  journal   = {Journal of Science and Technology: Information and Communication Technology (JST-ICT)},
+  volume    = {15},
+  number    = {01},
   year      = {2026}
 }
 ```
