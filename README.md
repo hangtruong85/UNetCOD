@@ -54,4 +54,4 @@ If you find this code useful in your research, please consider citing our paper:
 
 ## 📬 Contact
 
-For any questions or inquiries, please contact the corresponding author: **t3hang.miti@gmail.com**
+For any questions or inquiries, please contact the author: **t3hang.miti@gmail.com**
